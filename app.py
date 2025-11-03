@@ -1,4 +1,5 @@
 import os
+import logging
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from groq import Groq
@@ -7,6 +8,24 @@ from utils import is_valid_telex_payload, make_a2a_response
 load_dotenv()
 
 app = Flask(__name__)
+
+# --- 🧠 Configure Logging ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("app.log"),  # logs to a file named app.log
+        logging.StreamHandler()          # also logs to the console
+    ]
+)
+
+# Log every incoming request
+@app.before_request
+def log_request():
+    app.logger.info(f"Incoming {request.method} request → {request.path}")
+    if request.is_json:
+        app.logger.info(f"Request body: {request.get_json()}")
+
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 # --- Agent Metadata (Telex/Mastra Spec) ---
