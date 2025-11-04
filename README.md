@@ -27,7 +27,8 @@ Accepts Telex payload:
 {
   "event": "message_created",
   "message": { "text": "A lonely robot dreams of the ocean" }
-}```
+}
+```
 
 Responds with:
 
