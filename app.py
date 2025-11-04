@@ -3,164 +3,135 @@ import logging
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from groq import Groq
-from utils import is_valid_telex_payload, make_a2a_response
 from datetime import datetime
 from uuid import uuid4
-
+from pydantic import BaseModel, Field
+from typing import Literal, Optional, List, Dict, Any
 
 load_dotenv()
 
+# ---- Flask Setup ----
 app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
 
-# --- 🧠 Configure Logging ---
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler("app.log"),  # logs to a file named app.log
-        logging.StreamHandler()          # also logs to the console
-    ]
-)
+# ---- Models (ported from blog) ----
+class MessagePart(BaseModel):
+    kind: Literal["text", "data", "file"]
+    text: Optional[str] = None
+    data: Optional[Dict[str, Any]] = None
+    file_url: Optional[str] = None
 
-# Log every incoming request
-@app.before_request
-def log_request():
-    app.logger.info(f"Incoming {request.method} request → {request.path}")
-    if request.is_json:
-        app.logger.info(f"Request body: {request.get_json()}")
+class A2AMessage(BaseModel):
+    kind: Literal["message"] = "message"
+    role: Literal["user", "agent", "system"]
+    parts: List[MessagePart]
+    messageId: str = Field(default_factory=lambda: str(uuid4()))
+    taskId: Optional[str] = None
 
-# Initialize Groq client
+class TaskStatus(BaseModel):
+    state: Literal["working", "completed", "input-required", "failed"]
+    timestamp: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    message: Optional[A2AMessage] = None
+
+class Artifact(BaseModel):
+    artifactId: str = Field(default_factory=lambda: str(uuid4()))
+    name: str
+    parts: List[MessagePart]
+
+class TaskResult(BaseModel):
+    id: str
+    contextId: str
+    status: TaskStatus
+    artifacts: List[Artifact] = []
+    history: List[A2AMessage] = []
+    kind: Literal["task"] = "task"
+
+# ---- Groq Client ----
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-# --- Agent Metadata (Telex/Mastra Spec) ---
+# ---- Metadata ----
 AGENT_METADATA = {
     "name": "Story Agent",
     "description": "Takes in a phrase and returns a short (less than 250-word) story.",
     "version": "1.0.0",
     "author": "Ifeoluwa Adewumi",
-    "language": "Python",
     "framework": "Flask",
     "provider": "Groq",
-    "a2a": {
-        "endpoints": [
-            {
-                "name": "Story Generator",
-                "path": "/a2a/story-agent",
-                "description": "Generates a story based on the provided phrase",
-                "method": "POST"
-            }
-        ]
-    },
+    "a2a": {"endpoints": [{"name": "Story Generator", "path": "/a2a/story-agent", "method": "POST"}]},
     "health_url": "/health",
     "repo": "https://github.com/ifeadewumi/story-agent-flask",
     "logo_url": "https://i.ibb.co/Jc0Hkqs/story-logo.png"
 }
 
-
 @app.route("/", methods=["GET"])
 def metadata():
-    """Return metadata required for Telex registration."""
     return jsonify(AGENT_METADATA)
 
 @app.route("/a2a/story-agent", methods=["POST"])
 def story_agent():
-    """
-    A2A-compliant endpoint: processes JSON-RPC requests and returns structured responses.
-    """
-    try:
-        body = request.get_json(force=True)
+    body = request.get_json(force=True)
 
-        # ✅ Validate JSON-RPC structure
-        if body.get("jsonrpc") != "2.0" or "id" not in body:
-            return jsonify({
-                "jsonrpc": "2.0",
-                "id": body.get("id"),
-                "error": {
-                    "code": -32600,
-                    "message": "Invalid Request: jsonrpc must be '2.0' and 'id' is required."
-                }
-            }), 400
-
-        rpc_id = body["id"]
-        method = body.get("method")
-        params = body.get("params", {})
-
-        # Extract message text from A2A structure
-        if method == "message/send":
-            message = params.get("message", {})
-            parts = message.get("parts", [])
-        elif method == "execute":
-            messages = params.get("messages", [])
-            parts = messages[-1].get("parts", []) if messages else []
-        else:
-            return jsonify({
-                "jsonrpc": "2.0",
-                "id": rpc_id,
-                "error": {"code": -32601, "message": "Unsupported method"}
-            }), 400
-
-        # Get text input
-        text_input = ""
-        for part in parts:
-            if part.get("kind") == "text" and part.get("text"):
-                text_input = part["text"].strip()
-                break
-
-        if not text_input:
-            return jsonify({
-                "jsonrpc": "2.0",
-                "id": rpc_id,
-                "error": {"code": -32602, "message": "Missing text input in request."}
-            }), 400
-
-        # 🧠 Generate story using Groq
-        prompt = f"Write a short story (under 250 words) based on the phrase: '{text_input}'"
-        response = groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[{"role": "user", "content": prompt}],
-        )
-        story = response.choices[0].message.content.strip()
-
-        # ✅ Build A2A TaskResult-compliant response
-        result = {
-            "id": str(uuid4()),
-            "contextId": str(uuid4()),
-            "status": {
-                "state": "completed",
-                "timestamp": datetime.utcnow().isoformat(),
-                "message": {
-                    "kind": "message",
-                    "role": "agent",
-                    "parts": [{"kind": "text", "text": story}],
-                },
-            },
-            "artifacts": [],
-            "history": [],
-            "kind": "task",
-        }
-
+    if body.get("jsonrpc") != "2.0" or "id" not in body:
         return jsonify({
-            "jsonrpc": "2.0",
-            "id": rpc_id,
-            "result": result
-        }), 200
+            "jsonrpc": "2.0", "id": body.get("id"),
+            "error": {"code": -32600, "message": "Invalid Request"}
+        }), 400
 
-    except Exception as e:
+    rpc_id = body["id"]
+    method = body.get("method")
+    params = body.get("params", {})
+
+    # Extract text input
+    parts = []
+    if method == "message/send":
+        message = params.get("message", {})
+        parts = message.get("parts", [])
+    elif method == "execute":
+        messages = params.get("messages", [])
+        parts = messages[-1].get("parts", []) if messages else []
+    else:
         return jsonify({
-            "jsonrpc": "2.0",
-            "id": body.get("id") if "body" in locals() else None,
-            "error": {
-                "code": -32603,
-                "message": "Internal error",
-                "data": {"details": str(e)},
-            },
-        }), 500
+            "jsonrpc": "2.0", "id": rpc_id,
+            "error": {"code": -32601, "message": "Unsupported method"}
+        }), 400
 
+    text_input = next((p.get("text") for p in parts if p.get("kind") == "text"), "")
+    if not text_input:
+        return jsonify({
+            "jsonrpc": "2.0", "id": rpc_id,
+            "error": {"code": -32602, "message": "Missing text input"}
+        }), 400
+
+    # --- Generate Story ---
+    prompt = f"Write a short story (under 250 words) based on: '{text_input}'"
+    response = groq_client.chat.completions.create(
+        model="llama-3.1-8b-instant",
+        messages=[{"role": "user", "content": prompt}],
+    )
+    story = response.choices[0].message.content.strip()
+
+    # --- Build Proper A2A Result ---
+    response_msg = A2AMessage(
+        role="agent",
+        parts=[MessagePart(kind="text", text=story)]
+    )
+    result = TaskResult(
+        id=str(uuid4()),
+        contextId=str(uuid4()),
+        status=TaskStatus(state="completed", message=response_msg),
+        artifacts=[],
+        history=[],
+    )
+
+    return jsonify({
+        "jsonrpc": "2.0",
+        "id": rpc_id,
+        "result": result.model_dump()
+    }), 200
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "healthy", "agent": "story-agent"}), 200
-
+    return jsonify({"status": "healthy", "agent": "story-agent"})
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
